@@ -1,4 +1,5 @@
 const reservationRepository = require('../repositories/reservationRepository');
+const redisClient = require('../infrastructure/redis/redisClient');
 
 class ReservationService {
   async getAllReservations() {
@@ -13,28 +14,45 @@ class ReservationService {
       throw new Error('All fields are required');
     }
 
-    // Check for double booking
-    const isAlreadyBooked = await reservationRepository.findBySlot(
-      date.day, 
-      date.month, 
-      date.year, 
-      time
-    );
+    const lockKey = `lock:reservation:${date.year}:${date.month}:${date.day}:${time}`;
+    
+    // Attempt to acquire a distributed lock using Redis (10 second TTL)
+    const acquired = await redisClient.set(lockKey, 'locked', {
+      NX: true,
+      EX: 10
+    });
 
-    if (isAlreadyBooked) {
-      throw new Error('This slot is already reserved.');
+    if (!acquired) {
+      throw new Error('This slot is currently being booked by another user. Please try again in a few seconds.');
     }
 
-    const newReservation = { 
-      email, 
-      firstName, 
-      lastName, 
-      date, 
-      time, 
-      timestamp: new Date().toISOString() 
-    };
+    try {
+      // Check for double booking in the database
+      const isAlreadyBooked = await reservationRepository.findBySlot(
+        date.day, 
+        date.month, 
+        date.year, 
+        time
+      );
 
-    return await reservationRepository.save(newReservation);
+      if (isAlreadyBooked) {
+        throw new Error('This slot is already reserved.');
+      }
+
+      const newReservation = { 
+        email, 
+        firstName, 
+        lastName, 
+        date, 
+        time, 
+        timestamp: new Date().toISOString() 
+      };
+
+      return await reservationRepository.save(newReservation);
+    } finally {
+      // Release the lock
+      await redisClient.del(lockKey);
+    }
   }
 }
 
